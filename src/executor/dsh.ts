@@ -60,8 +60,8 @@ export interface ExecutorHost {
   /** DSH Cordis context: agents and their events, and the subprocess service used to run prepare commands. */
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
-  readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+  readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'finishAssignment'
+    | 'resumePhase' | 'deliveryFailed' | 'report' | 'assignmentInterrupted'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -222,6 +222,8 @@ export class DshExecutor implements Executor {
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
   private readonly personal = new Map<string, string>()
+  /** Per-Assignment step and token usage counted from worker Session events; stopped prevents duplicate budget reports. */
+  private readonly budgets = new Map<string, { steps: number; tokens: number; stopped: boolean }>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
@@ -229,7 +231,9 @@ export class DshExecutor implements Executor {
     this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
       () => host.store.settings().executor.maxWorkers)
     // Each launch reserves a worker slot so launches run concurrently while slots are free.
-    host.effects.handle('launch', payload => this.launchQueued(payload), { limit: () => host.paused() ? 0 : this.slots.launches(),
+    // Let one launch attempt through even when ordinary slots are full: a person's follow-up may use the extra wake slot,
+    // and a plain launch that cannot reserve a slot throws Later and retries.
+    host.effects.handle('launch', payload => this.launchQueued(payload), { limit: () => host.paused() ? 0 : Math.max(1, this.slots.launches()),
       retry: [5000, 300_000] })
     // Failed input deliveries are recorded on the ticket itself rather than reported through the `delivery` effect health entry (`quiet: true`).
     host.effects.handle('delivery', payload => this.deliverQueued(payload.ticketId), { limit: () => host.paused() ? 0 : 4, quiet: true })
@@ -271,7 +275,9 @@ export class DshExecutor implements Executor {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
-    this.slots.reserve(ticketId, 'launch')
+    // A person's waiting message may use the extra wake slot, so a follow-up is not queued behind a new launch.
+    const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
+    this.slots.reserve(ticketId, person ? 'person' : 'launch')
     try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
@@ -355,7 +361,7 @@ export class DshExecutor implements Executor {
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
-    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
+    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`); this.budgets.delete(assignment.id)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
@@ -494,12 +500,39 @@ export class DshExecutor implements Executor {
     // history: a step that claimed it may be cancelled or fail before, which drops it.
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const ticketId = ticketOfSession(session.id)
-      if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
-      const message = event.data
+      if (ticketId === undefined || this.host.closing()) return
+      if (event.type === 'user/message') {
+        if (event.data.source.kind !== 'dsh-superagent') return
+        const message = event.data
+        void this.background(Promise.resolve().then(() => {
+          const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
+            && this.host.sessions.promptedId(input.id) === message.id).map(input => input.id) ?? []
+          if (read.length) this.host.engine.inputsRead(ticketId, read)
+        }))
+        return
+      }
+      if (event.type !== 'step/start' && event.type !== 'assistant/message') return
+      const ticket = this.host.store.tickets.get(ticketId)
+      const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
+      if (!ticket || !assignment) return
+      const limits = this.host.store.settings().executor
+      const budget = this.budgets.get(assignment.id) ?? { steps: 0, tokens: 0, stopped: false }
+      this.budgets.set(assignment.id, budget)
+      if (budget.stopped) return
+      if (event.type === 'step/start') budget.steps += 1
+      else {
+        const usage = event.data.usage
+        if (usage) budget.tokens += usage.totalTokens ?? usage.inputTokens + usage.outputTokens
+      }
+      if (budget.steps <= limits.maxSteps && budget.tokens <= limits.maxTokens) return
+      budget.stopped = true
+      const summary = `Assignment stopped by the executor budget: ${budget.steps} steps (max ${limits.maxSteps}) / ${budget.tokens} tokens (max ${limits.maxTokens}). Inspect the worktree and split or retry the remaining work.`
       void this.background(Promise.resolve().then(() => {
-        const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
-          && this.host.sessions.promptedId(input.id) === message.id).map(input => input.id) ?? []
-        if (read.length) this.host.engine.inputsRead(ticketId, read)
+        const current = this.host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) return
+        this.failed(ticketId, summary)
+        this.host.engine.finishAssignment(ticketId, assignment.id, 'budget')
+        this.stop(current, assignment, 'budget')
       }))
     }))
     this.disposers.push(ctx.on('agent/error', ({ agent, error }) => {
@@ -533,6 +566,7 @@ export class DshExecutor implements Executor {
         this.host.engine.assignmentInterrupted(ticket.id, running.id)
       }
       else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.start(ticket, latest)
+      else if (latest?.state === 'ended' && ticket.undelivered.length && !waitsForPerson(ticket)) this.host.engine.resumePhase(ticket.id)
     }
   }
   /** Runs background worker event handling and updates the `worker` health entry on failure or recovery. */
@@ -617,7 +651,15 @@ export class DshExecutor implements Executor {
       return ((report?.state === 'ready' || !!stored.attention) && !since) || waitsForPerson(stored)
     }
     const before = live()
-    if (!before || this.host.closing()) return
+    if (!before) {
+      // A new phase may have started while this turn was ending. The old phase still has to hand off:
+      // stop its subagents, leave its jobs to the person and collect their ends.
+      const stored = this.host.store.tickets.get(ticket.id)
+      const previous = stored?.assignments.find(assignment => assignment.id === idle.id)
+      if (stored && liveTicket(stored) && previous?.state === 'ended' && runningAssignment(stored)?.id !== idle.id) this.handOff(ticket.id, agent)
+      return
+    }
+    if (this.host.closing()) return
     // A turn a person started in the Session is the person's work, which goes on in the background as any turn's does.
     const report = runningAssignment(before)?.report, person = this.personal.get(ticket.id)
     // The worker read what reached it before a turn that ended: one it handed off with, or one whose background work ended.

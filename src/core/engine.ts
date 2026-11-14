@@ -193,6 +193,14 @@ export class Engine {
   turnEnded(ticketId: string, assignmentId: string): void {
     this.repo.atomic(() => { this.assignments.turnEnded(ticketId, assignmentId) })
   }
+  /** End an Assignment because its phase finished, while keeping the Ticket open for a later Input. */
+  finishAssignment(ticketId: string, assignmentId: string, reason: string): void {
+    this.repo.atomic(() => { this.tickets.finishAssignment(ticketId, assignmentId, reason) })
+  }
+  /** Start the next phase of an open Ticket whose latest Assignment ended with Inputs still waiting. */
+  resumePhase(ticketId: string): void {
+    this.repo.atomic(() => { this.tickets.resumePhase(ticketId) })
+  }
   /** The Executor's fact that delivering Inputs to the Assignment that runs the ticket failed; the ticket shows it until a delivery succeeds. */
   deliveryFailed(ticketId: string, assignmentId: string, error: string): void {
     this.repo.atomic(() => { this.assignments.deliveryFailed(ticketId, assignmentId, error) })
@@ -266,5 +274,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
-export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'finishAssignment'
+  | 'resumePhase' | 'deliveryFailed' | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
