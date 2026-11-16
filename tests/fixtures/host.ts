@@ -236,10 +236,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const reader = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
   const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async () => reader) }
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
+  const connection = { requestRejection: () => undefined }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
+  const workspaceRegistry = { create: vi.fn(async (cwd: string, title?: string) => ({ id: cwd, title, setTitle: vi.fn(async () => {}),
+    attachSession: vi.fn(async () => {}) })), list: () => [], archivedSessionIds: [] as string[], archiveSession: vi.fn(async () => {}), delete: vi.fn(async () => {}) }
+  const workingDirectory = { get: vi.fn(() => ''), set: vi.fn(async (_agent: unknown, path: string) => path) }
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
-    sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
+    sessionPersistence: persistence, workspaceRegistry, workingDirectory, permissionPresets: { set: () => {} }, subprocess, webServer, connection,
     jobs: jobs.service, subagents: subagents.service }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)

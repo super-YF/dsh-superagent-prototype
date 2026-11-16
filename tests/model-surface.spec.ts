@@ -131,10 +131,11 @@ async function start() {
   const ctx = new Context()
   const history = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
   const services = { agents, llm: { resolveCallConfig: async (value: unknown) => value },
-    workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) },
+    workspaceRegistry: { create: async (cwd: string, title?: string) => ({ id: cwd, title, setTitle: async () => {}, attachSession: async () => {} }), list: () => [], archivedSessionIds: [], archiveSession: async () => {}, delete: async () => {} },
+    workingDirectory: { get: () => '', set: async (_agent: unknown, path: string) => path },
     sessionController: { create, resolveAgent, selectModel: async () => {}, rename: async () => {}, inspect: async () => ({ events: [] }) },
     sessionPersistence: { flush: async () => {}, open: async () => history }, permissionPresets: { set: () => {} }, subprocess,
-    webServer: { host: '127.0.0.1', port: 3082, register: () => () => {} } }
+    webServer: { host: '127.0.0.1', port: 3082, register: () => () => {} }, connection: { requestRejection: () => undefined } }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   const seed = new Store(join(directory, 'orchestrator.sqlite'))
   const github = { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }

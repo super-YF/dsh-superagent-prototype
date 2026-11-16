@@ -4,10 +4,11 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
+import { managedSessionIds, withinAnyRoot } from './session-policy.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
@@ -30,12 +31,16 @@ export interface SessionsHost {
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
   readonly masterId: string
+  /** The one Workspace dsh-superagent owns, titled `SA`; all of its Sessions are created in it. */
+  readonly workspacePath: string
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Roots whose workspaces and Sessions dsh-superagent owns; only Sessions outside the valid set are archived. */
+  reconcileRoots(): readonly string[]
 }
 
 /**
@@ -46,6 +51,13 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+/** The title of dsh-superagent's single Workspace, which every Session it creates belongs to. */
+export const WORKSPACE_TITLE = 'SA'
+/** DSH's working-directory service, resolved by name because it is a Host plugin rather than this bundle's peer. */
+interface WorkingDirectory {
+  get(session: Agent['session']): string
+  set(agent: Agent, path: string, signal?: AbortSignal): Promise<string>
+}
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -53,13 +65,12 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 /**
- * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
- * subagents. It gets no other tool the profile has, whenever it was registered: none that asks or shows a person something,
- * changes the profile, schedules work or starts goals outside the worker slots, the pause and a person's hold, starts or
- * messages other Sessions, or edits documents.
+ * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills and its todo list.
+ * It gets no tool that starts or messages other Sessions: one Ticket has exactly one Executor Session, while the main
+ * Session routes all work.
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
-  'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+  'web_fetch', 'skill', 'todo_write']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -96,6 +107,8 @@ export class Sessions {
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
+  /** The dedicated Workspace, created once and reused for every Session; its promise also serializes creation. */
+  private workspaceRecord?: ReturnType<Context['workspaceRegistry']['create']>
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
@@ -134,24 +147,120 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
+  /**
+   * Creates or reuses dsh-superagent's one Workspace, `SA`, and keeps its title. Workspace creation is idempotent by
+   * canonical path; an existing record keeps its old title, so it is retitled deliberately. The registry requires every
+   * Session's immutable header cwd to equal its Workspace path, which is why all Sessions are created against this one
+   * Workspace while a worker's effective directory is set separately (see `assignDirectory`).
+   */
+  async workspace(): Promise<Awaited<ReturnType<Context['workspaceRegistry']['create']>>> {
+    this.workspaceRecord ??= (async () => {
+      const workspace = await this.ctx.workspaceRegistry.create(this.host.workspacePath, WORKSPACE_TITLE)
+      if (workspace.title !== WORKSPACE_TITLE) await workspace.setTitle(WORKSPACE_TITLE)
+      return workspace
+    })()
+    return this.workspaceRecord
+  }
+  /**
+   * Resolves or creates session `id` inside the `SA` Workspace, initializes its role model, decorates it with
+   * prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. A worker's tools operate in
+   * `cwd` (its Ticket directory) even though its Session belongs to the shared Workspace.
+   */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
-      const workspace = await ctx.workspaceRegistry.create(cwd)
+      const workspace = await this.workspace()
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
+    await this.attach(result.agent, role)
     const settings = this.host.store.settings()
     await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    await this.assignDirectory(result.agent, cwd, role)
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /**
+   * Attaches an existing Session the registry no longer accounts for to the `SA` Workspace, which repairs the
+   * orchestrator created before this single-Workspace layout. A Session already in another Workspace is left alone:
+   * membership requires its immutable header cwd to equal that Workspace's path.
+   */
+  private async attach(agent: Agent, role: 'orchestrator' | 'worker'): Promise<void> {
+    const registry = this.ctx.workspaceRegistry
+    if (typeof registry.list !== 'function') return
+    if (registry.list().some(workspace => workspace.sessionIds.includes(agent.id as SessionId))) return
+    // Only the orchestrator can usually be repaired: a worker's header cwd is its Ticket directory, not the SA path.
+    if (role === 'worker') return
+    try {
+      const workspace = await this.workspace()
+      await workspace.attachSession(agent.id as SessionId)
+    } catch (error) {
+      this.ctx.logger.warn('dsh-superagent could not attach Session %s to Workspace %s: %s', agent.id,
+        this.host.workspacePath, String(error))
+    }
+  }
+  /** Makes a worker's tools run in its Ticket directory while its Session stays in the shared Workspace. */
+  private async assignDirectory(agent: Agent, cwd: string, role: 'orchestrator' | 'worker'): Promise<void> {
+    if (role !== 'worker' || !cwd) return
+    const get = (this.ctx as unknown as { get(name: string): unknown }).get.bind(this.ctx)
+    const workingDirectory = get('workingDirectory') as WorkingDirectory | undefined
+    if (!workingDirectory) throw new Error("dsh-superagent needs DSH's workingDirectory service to run a worker in its Ticket directory")
+    if (workingDirectory.get(agent.session) !== cwd) await workingDirectory.set(agent, cwd, this.host.lifetime)
+  }
+  /**
+   * Archives Sessions in dsh-superagent's own workspace roots that are not in the valid set (the orchestrator plus one
+   * worker per still-live Ticket), then removes legacy per-Ticket Workspace records that no longer hold a valid Session.
+   * Session logs and directories are kept. Called at startup so a legacy subagent, a deleted Ticket, or an ad-hoc
+   * per-Ticket Workspace disappears from the DSH UI without data loss.
+   */
+  async reconcile(): Promise<{ sessionId: string; workspaceId: string; path: string }[]> {
+    const registry = this.ctx.workspaceRegistry
+    if (typeof registry.list !== 'function' || typeof registry.archiveSession !== 'function') return []
+    const valid = new Set(managedSessionIds(this.host.masterId, this.host.store.tickets.list().filter(liveTicket)))
+    const archived = new Set(registry.archivedSessionIds)
+    const roots = this.host.reconcileRoots()
+    const actions: { sessionId: string; workspaceId: string; path: string }[] = []
+    const removed: string[] = []
+    for (const workspace of registry.list()) {
+      if (!withinAnyRoot(roots, workspace.path)) continue
+      let failed = false
+      for (const sessionId of workspace.sessionIds) {
+        if (valid.has(sessionId) || archived.has(sessionId)) continue
+        try {
+          await registry.archiveSession(sessionId, { stopActivity: true })
+          archived.add(sessionId)
+          actions.push({ sessionId, workspaceId: String(workspace.id), path: workspace.path })
+        } catch (error) {
+          failed = true
+          this.ctx.logger.warn('dsh-superagent could not archive orphan Session %s in %s: %s', sessionId, workspace.path,
+            String(error))
+        }
+      }
+      // Older versions created one Workspace per Ticket directory. Once none of its Sessions is valid, removing the
+      // registration is enough: its directory and Session logs stay, and the dedicated SA Workspace is never removed.
+      const dedicated = resolve(workspace.path) === resolve(this.host.workspacePath)
+      if (!dedicated && !failed && typeof registry.delete === 'function'
+        && !workspace.sessionIds.some(sessionId => valid.has(sessionId))) {
+        try {
+          await registry.delete(workspace.id)
+          removed.push(workspace.path)
+        } catch (error) {
+          this.ctx.logger.warn('dsh-superagent could not remove legacy Workspace %s: %s', workspace.path, String(error))
+        }
+      }
+    }
+    if (actions.length) this.ctx.logger.info('dsh-superagent archived %d orphan Session(s): %s', actions.length,
+      actions.map(action => action.sessionId).join(', '))
+    else this.ctx.logger.info('dsh-superagent Session policy valid: %d managed Session(s)', valid.size)
+    if (removed.length) this.ctx.logger.info('dsh-superagent removed %d legacy Workspace(s): %s', removed.length,
+      removed.join(', '))
+    return actions
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {

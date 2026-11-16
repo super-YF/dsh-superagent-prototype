@@ -1,4 +1,4 @@
-/** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
+/** Management HTTP routes guarded by DSH Connection's Host/Origin fence and browser authentication. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -71,11 +71,6 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 }
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
-}
-export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
-  const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
@@ -228,13 +223,22 @@ function match(table: Routes, method: string, segments: string[]) {
   return undefined
 }
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
-  if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
   const table = routes(runtime)
   const disposers = [
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      // DSH Connection owns the Host/Origin fence and browser/API authentication, including Tailnet Serve and other
+      // configured public origins. The extra header keeps ordinary cross-site form posts out even when a cookie is present.
+      const rejection = (ctx as unknown as { connection: { requestRejection(request: { headers: typeof req.headers }): 401 | 403 | undefined } }).connection.requestRejection(req)
+      if (rejection !== undefined) {
+        json(res, rejection, { error: rejection === 401 ? 'Authentication required' : 'Same-origin management request required' })
+        return
+      }
+      if (req.headers['x-orchestrator-request'] !== '1') {
+        json(res, 403, { error: 'Same-origin management request required' })
+        return
+      }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
