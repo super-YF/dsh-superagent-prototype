@@ -15,7 +15,7 @@ export interface WorkerReport {
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
   askedBy?: string
-  /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
+  /** The person's question this report answers, which the worker thereby takes up; authorizes the assessment Session to send an answer reply. */
   answers?: string
 }
 const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'

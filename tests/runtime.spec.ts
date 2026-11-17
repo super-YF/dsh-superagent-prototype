@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { assessSessionId } from '../src/app/session-policy.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
@@ -36,6 +37,7 @@ import { decisionList, search, threadDetail, threadList } from '../src/app/views
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
 
 let runtime: Runtime
+declare module '../src/app/runtime.ts' { interface Runtime { /** Test-only alias; production has no global Session. */ readonly masterId: string } }
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
 let directory: string
@@ -107,12 +109,20 @@ function seed(store: Store, accounts: Accounts = {}): void {
   store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
 }
 let restarts: ReturnType<typeof vi.fn<() => void>>
+/** Test-only alias for the assessment Session most recently created: production has no global Session. */
+async function aliasMaster(value: Runtime): Promise<Runtime> {
+  await value.sessions.assess('test:main')
+  const seeded = assessSessionId('test:main')
+  Object.defineProperty(value, 'masterId', { get: () => deliveries.mock.calls.map(([call]) => call.sessionId).filter(id => id.startsWith('assess-')).at(-1)
+    ?? [...agents.keys()].filter(id => id.startsWith('assess-')).at(-1) ?? seeded })
+  return value
+}
 async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
   await runtime.stop()
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store, accounts); store.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-  runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machine }), restarts)
+  runtime = await aliasMaster(new Runtime(ctx, testMachine({ stateDir: directory, ...machine }), restarts))
   return runtime
 }
 let deliveries: ReturnType<typeof vi.fn<(request: { sessionId: string; mode: 'queue' | 'steer'; id: string; text: string }) => void>>
@@ -217,6 +227,7 @@ beforeEach(async () => {
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
   runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
   await runtime.ready
+  await aliasMaster(runtime)
   // Source kinds are normally registered by plugins that are not loaded in unit tests.
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
@@ -224,6 +235,21 @@ beforeEach(async () => {
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
 
+it('reuses one assessment Session for every message on a Thread and creates a new one for a new Thread', async () => {
+  const one = feishu('1', '@bot 修一')
+  const same = [feishu('2', '@bot 修二', { root_id: 'om_1' }), feishu('3', '@bot 修三', { root_id: 'om_1' })]
+  const other = feishu('4', '@bot 另一件事')
+  runtime.receive(one); for (const trigger of same) runtime.receive(trigger)
+  await runtime.idle()
+  const first = assessSessionId(threadKey(one.threads[0]!))
+  await vi.waitFor(() => expect(agents.get(first)).toBeDefined())
+  await runtime.idle()
+  expect(controller.create.mock.calls.filter(([request]) => request.sessionId === first)).toHaveLength(1)
+  runtime.receive(other); await runtime.idle()
+  const second = assessSessionId(threadKey(other.threads[0]!))
+  await vi.waitFor(() => expect(agents.get(second)).toBeDefined())
+  expect(second).not.toBe(first)
+})
 it('keeps every Session it creates in the single SA Workspace while running a worker in its Ticket directory', async () => {
   const { ticket } = await acceptedTicket()
   expect(workspaceRegistry.create).toHaveBeenCalledTimes(1)
@@ -588,7 +614,8 @@ it('lets an Executor drop only its own ticket from a thread it finds unrelated, 
   // An attached thread that turns out to be about something else, which another ticket also follows.
   const attached = { source: 'feishu', id: 'oc_side:om_side' }
   subscribe(ticket.id, attached); subscribe(other.ticket.id, attached)
-  const inject = agents.get(runtime.masterId)!.inject
+  const assessor = assessSessionId(threadKey(trigger.threads[0]!))
+  const inject = agents.get(assessor)!.inject
   vi.mocked(inject).mockClear()
   expect(await runTool(sessionId, 'orchestrator_thread_unrelated', { thread: 'feishu:oc_side:om_side', reason: 'It discusses the login page, not this regression.' })).toEqual({ removed: true, thread: 'feishu:oc_side:om_side' })
   expect(runtime.store.threads.get('feishu:oc_side:om_side')!.subscriptions).toEqual([other.ticket.id])
@@ -760,13 +787,13 @@ it('counts every step of the day\'s flow over the same arriving messages and lis
   expect(decisionList(viewsOf(runtime), ['accept', 'reopen'], 0, 10, new Date(Date.now() + 60_000).toISOString()).items).toEqual([])
 })
 
-it('queues a requeued trigger visibly and tells the orchestrator', async () => {
+it('queues a requeued trigger visibly, and a queued notice wakes no Session', async () => {
   const stranger = commentTrigger({ id: 3, body: 'looks wrong', user: { login: 'someone' }, html_url: 'https://github.com/acme/widgets/pull/8#issuecomment-3', created_at: '2026-09-09T00:00:00Z' }, { number: 8, isPr: true }, 'conversation', 'agent-bot')
   await receive(stranger)
   runtime.store.saveSettings({ ...runtime.store.settings(), paused: true })
   expect(runtime.engine.reevaluate(stranger.id)).toBe(true)
   expect(threadDetail(viewsOf(runtime), 'github:8', undefined, 50)!.timeline[0]!.disposition).toMatchObject({ queued: true })
-  await vi.waitFor(() => expect(agents.get(runtime.masterId)!.inject).toHaveBeenCalled())
+  expect(agents.get(assessSessionId(threadKey(stranger.threads[0]!)))).toBeUndefined()
 })
 
 it('asks a question where the human message that raised it was written, not in the ticket\'s original conversation', async () => {
@@ -1369,7 +1396,8 @@ it('tells the main Session of each requeue of the same Trigger', async () => {
   const stranger = commentTrigger({ id: 4, body: 'still wrong', user: { login: 'someone' }, html_url: 'https://github.com/acme/widgets/pull/8#issuecomment-4', created_at: '2026-09-09T00:00:00Z' },
     { number: 8, isPr: true, url: 'https://github.com/acme/widgets/pull/8' }, 'conversation', 'agent-bot')
   await receive(stranger)
-  const requeued = () => agents.get(runtime.masterId)!.inject.mock.calls.filter(([message]) => JSON.stringify(message).includes('trigger_requeued')).length
+  await runtime.sessions.assess('github:8')
+  const requeued = () => agents.get(assessSessionId(threadKey(stranger.threads[0]!)))!.inject.mock.calls.filter(([message]) => JSON.stringify(message).includes('trigger_requeued')).length
   expect(runtime.engine.reevaluate(stranger.id)).toBe(true)
   await runtime.idle()
   expect(runtime.engine.reevaluate(stranger.id)).toBe(true)
@@ -1434,7 +1462,7 @@ it('releases the database and the state directory lock when it fails to start, s
   fixed.prepare('UPDATE kv SET value=? WHERE key=?').run(String(SCHEMA_VERSION), 'schema')
   fixed.close()
   // A lock kept by the failed start would make this throw that the lock is already held.
-  runtime = new Runtime(context(), testMachine({ stateDir: directory }), vi.fn())
+  runtime = await aliasMaster(new Runtime(context(), testMachine({ stateDir: directory }), vi.fn()))
   await runtime.ready
   expect(runtime.store.get(KV.store.schema)).toBe(SCHEMA_VERSION)
 })
@@ -1818,9 +1846,12 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
 })
 
 it('archives only orphan Sessions inside the managed workspace roots at reconciliation', async () => {
+  const liveThread = { key: 'feishu:oc_team:om_1', ref: { source: 'feishu', id: 'oc_team:om_1' }, createdAt: '', subscriptions: [], correlated: [], pending: [], meta: {} }
+  runtime.store.threads.save(liveThread)
+  const assessor = assessSessionId(liveThread.key)
   const stale = join(directory, 'work', 'deleted-ticket')
   workspaceRegistry.list = () => [
-    { id: 'workspace-master', path: directory, sessionIds: [runtime.masterId] },
+    { id: 'workspace-master', path: directory, sessionIds: [assessor] },
     { id: 'workspace-stale', path: stale, sessionIds: ['worker-deleted', 'orchestrator-stale'] },
     { id: 'workspace-user', path: join(tmpdir(), 'unmanaged-session-workspace'), sessionIds: ['session-user'] },
   ]
@@ -1832,7 +1863,7 @@ it('archives only orphan Sessions inside the managed workspace roots at reconcil
   ])
   // A per-Ticket Workspace with no valid Session left is removed; the dedicated SA Workspace and user workspaces stay.
   expect(workspaceRegistry.delete.mock.calls).toEqual([['workspace-stale']])
-  // The orchestrator stays visible; a Session in a workspace outside the roots is not ours to archive.
-  expect(workspaceRegistry.archiveSession).not.toHaveBeenCalledWith(runtime.masterId, expect.anything())
+  // A live Thread's assessment Session stays visible; a Session in a workspace outside the roots is not ours to archive.
+  expect(workspaceRegistry.archiveSession).not.toHaveBeenCalledWith(assessor, expect.anything())
   expect(workspaceRegistry.archiveSession).not.toHaveBeenCalledWith('session-user', expect.anything())
 })

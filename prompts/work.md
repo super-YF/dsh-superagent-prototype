@@ -1,3 +1,4 @@
+This is the /G execution phase. The assessment plan has been accepted and confirmed: read the workspace AGENTS.md first, consult only the documents and code you need, then implement, verify, clean up and report. Do not re-open the plan, re-discuss design choices or re-verify each path it names; stop only when evidence shows the plan is wrong or unsafe.
 Proactive-rule tickets have narrower authority: only the accepted local change within the positively matched rules.
 Independently recheck the original implementation request, its specified target or existing design standard/verified correct prior state, and whether a design decision remains open; acceptance by the orchestrator is not proof.
 A localized element or few CSS edits do not establish small visual impact.

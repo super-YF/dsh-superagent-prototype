@@ -15,7 +15,7 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
-import { resultRelay } from '../app/notices.ts'
+import { resultRelay, ticketThread } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
@@ -69,7 +69,7 @@ export interface ExecutorHost {
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
-  /** Session manager for worker sessions and for relaying worker reports to the main Session. */
+  /** Session manager for worker sessions and for relaying worker reports to the assessment Session. */
   readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
@@ -99,14 +99,16 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
   const note = outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : ''
+  const plan = outcome.plan ?? ticket.plan
+  const planned = plan ? `\n评估已确认的计划（直接执行，不再逐项讨论或复核路径）：\n${plan}` : ''
   const ruleIds = ticket.mandate.basis.rules
   const rules = settings.policy.rules.filter(rule => ruleIds?.includes(rule.id))
     .map(rule => `\n- ${rule.name} (${rule.id}): ${rule.instruction}`).join('')
   const precedence = rules ? `\nMatched rules; their procedure and communication instructions take precedence over the default acknowledgement and messaging policy for this ticket:${rules}` : ''
   // The origin trigger is delivered alongside the assignment, so `assignment` omits the trigger text.
   const assignment = ticket.mandate.strength === 'inferred' && ruleIds
-    ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
-    : note.trim()
+    ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${planned}${note}`
+    : `${planned}${note}`.trim()
   return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
@@ -419,14 +421,14 @@ export class DshExecutor implements Executor {
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
     this.failed(ticketId, String(error))
   }
-  /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
+  /** Records a `failed` report on the ticket and relays the failure to the assessment Session in one transaction. */
   private failed(ticketId: string, summary: string): void {
     this.host.store.atomic(() => {
       const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
-      this.relay(resultRelay(updated, 'failed', summary))
+      this.relay(resultRelay(updated, 'failed', summary, undefined, ticketThread(this.host.store, updated)))
     })
   }
-  private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
+  private relay({ id, text, targetThread }: { id: string; text: string; targetThread?: string }): void { this.host.sessions.relay(id, text, targetThread) }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
     const current = () => {
       if (this.host.closing()) throw new Error('dsh-superagent is stopping')
@@ -706,9 +708,10 @@ export class DshExecutor implements Executor {
       const before = latestReport(current)?.summary ?? ''
       const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before })
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
-      if (said) this.relay(resultRelay(updated, 'waiting', said))
+      if (said) this.relay(resultRelay(updated, 'waiting', said, undefined, ticketThread(this.host.store, updated)))
       else if (!before.trim()) {
-        this.relay(resultRelay(updated, 'waiting', 'Worker ended without a status report. Use orchestrator_ticket_request_status to request one.'))
+        this.relay(resultRelay(updated, 'waiting', 'Worker ended without a status report. Use orchestrator_ticket_request_status to request one.',
+          undefined, ticketThread(this.host.store, updated)))
       }
     })
   }

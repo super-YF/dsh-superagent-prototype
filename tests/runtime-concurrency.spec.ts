@@ -99,6 +99,8 @@ it('runs prepare commands in the background, side by side, while accepts, intake
   const later = feishu('3', '@bot 修三')
   expect(h.runtime.receive(later)).toBe('stored')
   await h.runtime.pump()
+  // The candidate card for the new Thread may be awaited after the pass that saw it.
+  await waitUntil(() => h.candidates().includes(later.id))
   expect(h.candidates()).toEqual([...first, later].map(trigger => trigger.id))
   prepare.resolve()
   await h.runtime.idle()

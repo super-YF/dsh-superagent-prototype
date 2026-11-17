@@ -29,7 +29,7 @@ export function directionAllowed(value: unknown): value is AdmissionDirection {
 }
 export interface Assessment {
   decision: 'accept' | 'ignore' | 'unavailable'; rule_assessments: RuleAssessment[]; direction: unknown
-  title: string; scope: string; reason: string; intent_evidence?: string | null; acknowledgement?: string | null; worktree_name?: string
+  title: string; scope: string; reason: string; plan?: string | null; intent_evidence?: string | null; acknowledgement?: string | null; worktree_name?: string
 }
 /**
  * Validate an assessment against enabled rules and convert it into an engine `AssessmentOutcome`.
@@ -56,8 +56,9 @@ export function assessmentOutcome(assessment: Assessment, settings: Pick<Setting
     const proposal = { title, scope, worktree_name: name }
     return { kind: 'ignore', audit: { ...audit, would_accept: true, proposal }, reason: { code: 'observed', values: { text: assessment.reason } } }
   }
+  const plan = assessment.plan?.trim()
   return { kind: 'accept', title, scope, reason: assessment.reason, ...(assessment.acknowledgement ? { acknowledgement: assessment.acknowledgement } : {}),
-    rules: matches.map(match => match.rule_id), audit, ...(name ? { name } : {}) }
+    rules: matches.map(match => match.rule_id), audit, ...(name ? { name } : {}), ...(plan ? { plan } : {}) }
 }
 const DEFAULT_RULES = [
   { id: 'copy', name: 'Copy fixes', enabled: true, instruction: 'Explicit requests to correct a typo, wording, punctuation or existing translation. Preserve product promises and business meaning.' },

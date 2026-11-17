@@ -1,9 +1,14 @@
 /** Session-policy helpers: the only Sessions dsh-superagent owns, and which workspace paths it manages. */
+import { key } from '../core/index.ts'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 
-/** Returns the IDs of every Session dsh-superagent owns: one orchestrator and one worker per Ticket. */
-export function managedSessionIds(masterId: string, tickets: readonly { id: string }[]): string[] {
-  return [masterId, ...tickets.map(ticket => `worker-${ticket.id}`)]
+/** Returns the one assessment Session ID for a Thread key (`assess-<hash>`), reused for every message on that Thread. */
+export const assessSessionId = (thread: string): string => `assess-${key(thread)}`
+/** Whether `sessionId` names an assessment Session. */
+export const isAssessSession = (sessionId: string): boolean => sessionId.startsWith('assess-')
+/** Returns the IDs of every Session dsh-superagent owns: one assessment Session per Thread and one worker per live Ticket. */
+export function managedSessionIds(threads: readonly { key: string }[], tickets: readonly { id: string }[]): string[] {
+  return [...threads.map(thread => assessSessionId(thread.key)), ...tickets.map(ticket => `worker-${ticket.id}`)]
 }
 
 /** Whether `path` is `root` or a descendant of it, after resolving both. */

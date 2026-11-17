@@ -10,7 +10,7 @@ import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
-/** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
+/** Whether an Input is a message no person wrote, such as CI's, a bot's, or the assessment Session's note. */
 export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
 /**
  * Whether a ticket's worker read a Trigger Input before `until`, its latest report or turn end: its Session took the message
@@ -40,7 +40,7 @@ export class Tickets extends EnginePart {
     // Fall back to the last trigger for Evals recorded before `primary` existed.
     const primary = this.repo.triggers.get(evaluation.primary ?? triggerIds.at(-1)!)
     const origin = { triggerId: primary?.id ?? triggerIds[0]!, triggerIds }
-    let ticket: Ticket = { id, title: outcome.title, decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
+    let ticket: Ticket = { id, title: outcome.title, ...(outcome.plan ? { plan: outcome.plan } : {}), decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
       createdAt: at, updatedAt: at, origin }
     for (const triggerId of triggerIds) {
       const channel = this.repo.triggers.get(triggerId)?.channel
@@ -336,7 +336,7 @@ export class Tickets extends EnginePart {
     for (const trigger of left) {
       const disposition = this.repo.triggers.disposition(trigger.id)
       const decision = disposition?.decisionId ? this.repo.decisions.get(disposition.decisionId) : undefined
-      // The main Session that stopped this ticket on the message decides the rest of it itself, unless a ticket handed it back.
+      // The assessment Session that stopped this ticket on the message decides the rest of it itself, unless a ticket handed it back.
       const stopped = decision?.kind === 'stop' && decision.ticketId === ticketId && !disposition?.handbacks?.length
       const decided = !!decision && (settled(decision) || stopped)
       if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) this.queueForEval(trigger)
